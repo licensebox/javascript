@@ -7,6 +7,6 @@ permissions:
   contents: read
 jobs:
   conformance:
-    uses: licensebox/protocol/.github/workflows/sdk.yml@a6a2b86d377c34a760827c74bf2a25db17e64f92
+    uses: licensebox/protocol/.github/workflows/sdk.yml@f210048228da2fcb2b11618d52b481a8e8f2f79e
     with:
       language: javascript
