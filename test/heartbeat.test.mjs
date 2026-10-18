@@ -81,3 +81,38 @@ test('returned heartbeat cannot mutate cached grants or expiry',async t=>{
   await assert.rejects(client.heartbeat('core'),error=>error.code==='io_error');
   assert.equal(readFileSync(join(client.directory,'install.key'),'utf8'),'damaged');
 });
+
+test('offline monitor preserves absolute monotonic deadline across clock rollback',async t=>{
+  const client=fixture(t),initial=result();let calls=0;
+  client.heartbeat=async()=>++calls===1?initial:{...initial,online:false};
+  const monitor=await client.watch('core',{intervalSeconds:0.01});
+  const before=monitor.deadline;client.clock=()=>Date.now()/1000-3600;
+  t.after(()=>monitor.stop());
+  assert.equal((await bounded(monitor.done)).code,'expired');
+  assert.equal(monitor.deadline,before);assert.ok(calls>1);
+});
+test('late online microtask cannot replace a deadline before pending expiry timer runs',async t=>{
+  const client=fixture(t),initial=result(0.1);let calls=0,release,entered;
+  const started=new Promise(resolve=>{entered=resolve;});
+  client.heartbeat=async()=>{
+    if(++calls===1)return initial;
+    entered();return new Promise(resolve=>{release=()=>resolve(result(60));});
+  };
+  const monitor=await client.watch('core',{intervalSeconds:0.01});
+  t.after(()=>{monitor.stop();release?.();});
+  await started;
+  // Delay timers while making the renewed result's microtask ready first.
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,150);
+  release();
+  assert.equal((await bounded(monitor.done)).code,'expired');
+  assert.equal(monitor.latest.lease.expires,initial.lease.expires);
+});
+test('known403 headers remain an explicit HTTP error when body exceeds budget',async t=>{
+  const client=fixture(t),original=globalThis.fetch;
+  globalThis.fetch=async(_url,{signal})=>new Response(new ReadableStream({
+    start(controller){signal.addEventListener('abort',()=>controller.error(signal.reason),{once:true});}
+  }),{status:403});
+  try {
+    await bounded(assert.rejects(client.post('/v1/renew',{},20),error=>error.code==='http_error'&&error.status===403));
+  } finally {globalThis.fetch=original;}
+});

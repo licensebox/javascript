@@ -1,6 +1,6 @@
 {
   "name": "@licensebox/client",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Machine-bound Licensebox licensing for Node.js and desktop apps",
   "type": "module",
   "main": "./dist/index.js",

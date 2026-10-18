@@ -202,6 +202,13 @@ export class Client {
     catch { throw new LicenseboxError('io_error','saved policy refusal is damaged; connect to renew'); }
     throw new PolicyError(value.code,value.detail);
   }
+  private transportFailure(status: number, signal?: AbortSignal): LicenseboxError {
+    if (this.config.signal?.aborted || signal?.aborted) return new LicenseboxError('cancelled');
+    // Receiving explicit refusal headers is enough to prohibit offline fallback,
+    // even when the response body fails or exceeds the network deadline.
+    if (status >= 300 && status < 500) return new LicenseboxError('http_error',`HTTP ${status}`,status);
+    return new LicenseboxError('network_error','cannot reach the licensing server',status);
+  }
   private async post<T = Json>(path: string, value: Json, timeout = 20_000, signal?: AbortSignal): Promise<T> {
     let response: Response;
     let observedStatus = 0;
@@ -221,7 +228,7 @@ export class Client {
               if (length > limit) { incoming.destroy(); reject(new LicenseboxError('protocol_error','server response exceeded size limit',incoming.statusCode)); }
               else chunks.push(chunk);
             });
-            incoming.on('error',error => reject(new LicenseboxError(requestSignal.aborted && (signal?.aborted || this.config.signal?.aborted) ? 'cancelled' : 'network_error','cannot read server response',incoming.statusCode)));
+            incoming.on('error',() => reject(this.transportFailure(incoming.statusCode ?? 0,signal)));
             incoming.on('end',() => resolve(new Response([204,205,304].includes(incoming.statusCode ?? 0) ? null : Buffer.concat(chunks),{status:incoming.statusCode ?? 500})));
           });
           request.on('error',reject); request.end(JSON.stringify(value));
@@ -231,7 +238,7 @@ export class Client {
       }
     } catch (error) {
       if (error instanceof LicenseboxError) throw error;
-      throw new LicenseboxError(this.config.signal?.aborted || signal?.aborted ? 'cancelled' : 'network_error', 'cannot reach the licensing server',observedStatus);
+      throw this.transportFailure(observedStatus,signal);
     }
     const reader = response.body?.getReader();
     const chunks: Uint8Array[] = []; let length = 0;
@@ -242,7 +249,7 @@ export class Client {
         if (length > limit) { await reader.cancel(); throw new LicenseboxError('protocol_error','server response exceeded size limit',response.status); }
         chunks.push(next.value);
       }
-    } catch (error) { if (error instanceof LicenseboxError) throw error; throw new LicenseboxError(this.config.signal?.aborted || signal?.aborted ? 'cancelled' : 'network_error','cannot read server response',response.status); }
+    } catch (error) { if (error instanceof LicenseboxError) throw error; throw this.transportFailure(response.status,signal); }
     let answer: any;
     try { answer = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
     catch { throw new LicenseboxError(response.status === 200 ? 'protocol_error':'http_error',`HTTP ${response.status}`,response.status); }
