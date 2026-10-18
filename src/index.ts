@@ -188,7 +188,8 @@ export class Client {
   private existingKey(): KeyObject {
     const seed = this.read('install.key');
     if (!seed) throw new LicenseboxError('not_signed_in','the installation key is unavailable; explicitly sign in');
-    return createPrivateKey({key:Buffer.concat([privatePrefix,decode(seed,32)]),format:'der',type:'pkcs8'});
+    try { return createPrivateKey({key:Buffer.concat([privatePrefix,decode(seed,32)]),format:'der',type:'pkcs8'}); }
+    catch { throw new LicenseboxError('io_error','the installation key is damaged; explicitly sign in'); }
   }
   private async own(value: Lease, key?: KeyObject): Promise<void> {
     if (value.binding !== this.binding() || value.machine !== this.publicKey(key ?? await this.key())) throw new PolicyError('machine_changed','these credentials belong to another machine; explicitly sign in to activate here');

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtempSync,rmSync,existsSync,writeFileSync} from 'node:fs';
+import {mkdtempSync,rmSync,existsSync,writeFileSync,readFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {setTimeout as delay} from 'node:timers/promises';
@@ -35,6 +35,7 @@ test('offline success cannot extend last signed deadline',async t=>{
   const client=fixture(t), initial=result(); let calls=0;
   client.heartbeat=async()=>++calls===1?initial:{...initial,online:false};
   const monitor=await client.watch('core',{intervalSeconds:0.01});
+  const snapshot=monitor.latest;snapshot.lease.expires='2099-01-01T00:00:00Z';
   assert.equal((await bounded(monitor.done)).code,'expired'); assert.ok(calls>1);
 });
 test('refusal cancels work; rejected notification is contained',async t=>{
@@ -76,4 +77,7 @@ test('returned heartbeat cannot mutate cached grants or expiry',async t=>{
   const response=await client.heartbeat('core');response.lease.modules.push('export');response.lease.expires='2099-01-01T00:00:00Z';
   await assert.rejects(client.require('export'),error=>error.code==='module_denied');
   assert.equal((await client.lease()).expires,lease.expires);
+  writeFileSync(join(client.directory,'install.key'),'damaged');
+  await assert.rejects(client.heartbeat('core'),error=>error.code==='io_error');
+  assert.equal(readFileSync(join(client.directory,'install.key'),'utf8'),'damaged');
 });
