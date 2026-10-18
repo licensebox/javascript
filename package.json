@@ -1,0 +1,17 @@
+{
+  "name": "@licensebox/client",
+  "version": "0.1.0",
+  "description": "Machine-bound Licensebox licensing for Node.js and desktop apps",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {".": {"types": "./dist/index.d.ts", "import": "./dist/index.js"}},
+  "files": ["dist", "README.md", "LICENSE", "protocol-lock.json"],
+  "engines": {"node": ">=22"},
+  "scripts": {"build": "tsc", "test": "npm run build && node --test test/*.test.mjs", "prepack": "npm run build"},
+  "devDependencies": {"@types/node": "^22.18.0", "typescript": "^5.9.3"},
+  "license": "MIT",
+  "author": "Vijai Kumar",
+  "repository": {"type": "git", "url": "https://github.com/licensebox/javascript.git"},
+  "homepage": "https://licensebox.dev"
+}
