@@ -3,12 +3,14 @@ import { mkdirSync, readFileSync, openSync, closeSync, writeFileSync, chmodSync,
 import { homedir, platform, arch } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { request as httpsRequest } from 'node:https';
 import { setTimeout as delay } from 'node:timers/promises';
 
 type Json = Record<string, any>;
 export interface Lease {
   v: number; kid: string; product: string; user: string; email: string; machine: string; binding: string;
   modules: string[]; issued: string; expires: string; terms: number;
+  heartbeat?: {interval_seconds: number; grace_seconds: number} | null;
 }
 export interface Module { name: string; description?: string; free: boolean; have: boolean; requested?: boolean }
 export interface AccessRequest { id: string; modules: string[]; note?: string; status: string; granted?: string[]; until?: string; answer?: string }
@@ -20,6 +22,8 @@ export interface Config {
   /** Seconds since the Unix epoch. */
   clock?: () => number;
   signal?: AbortSignal;
+  /** Optional trusted TLS root bundle; hostname verification stays enabled. */
+  caBundle?: string;
 }
 
 export class LicenseboxError extends Error {
@@ -101,6 +105,12 @@ export function verifyLease(token: string, product: string, keys: Record<string,
   if (value.product !== product || !validBinding(value.binding)) throw new LicenseboxError('malformed', 'lease product or native binding does not match');
   decode(value.machine, 32);
   if (!Array.isArray(value.modules) || value.modules.some(x => typeof x !== 'string')) throw new LicenseboxError('malformed', 'invalid module list');
+  const heartbeat = value.heartbeat;
+  if (heartbeat != null) {
+    if (typeof heartbeat !== 'object' || Array.isArray(heartbeat)) throw new LicenseboxError('malformed','invalid heartbeat policy');
+    const {interval_seconds: interval, grace_seconds: grace} = heartbeat;
+    if (!Number.isInteger(interval) || !Number.isInteger(grace) || interval < 30 || interval > 86400 || grace < interval || grace > 31536000 || epoch(value.expires) > epoch(value.issued) + grace) throw new LicenseboxError('malformed','invalid heartbeat policy or contact deadline');
+  }
   if (now >= epoch(value.expires) && !allowExpired) throw new LicenseboxError('expired');
   return value;
 }
@@ -175,8 +185,13 @@ export class Client {
     throw new LicenseboxError('io_error','installation key is damaged or being written by another process');
   }
   private publicKey(key: KeyObject): string { return encode((createPublicKey(key).export({format:'der',type:'spki'}) as Buffer).subarray(-32)); }
-  private async own(value: Lease): Promise<void> {
-    if (value.binding !== this.binding() || value.machine !== this.publicKey(await this.key())) throw new PolicyError('machine_changed','these credentials belong to another machine; explicitly sign in to activate here');
+  private existingKey(): KeyObject {
+    const seed = this.read('install.key');
+    if (!seed) throw new LicenseboxError('not_signed_in','the installation key is unavailable; explicitly sign in');
+    return createPrivateKey({key:Buffer.concat([privatePrefix,decode(seed,32)]),format:'der',type:'pkcs8'});
+  }
+  private async own(value: Lease, key?: KeyObject): Promise<void> {
+    if (value.binding !== this.binding() || value.machine !== this.publicKey(key ?? await this.key())) throw new PolicyError('machine_changed','these credentials belong to another machine; explicitly sign in to activate here');
   }
   private denial(): void {
     const saved = this.read('policy-denial');
@@ -186,14 +201,36 @@ export class Client {
     catch { throw new LicenseboxError('io_error','saved policy refusal is damaged; connect to renew'); }
     throw new PolicyError(value.code,value.detail);
   }
-  private async post<T = Json>(path: string, value: Json, timeout = 20_000): Promise<T> {
+  private async post<T = Json>(path: string, value: Json, timeout = 20_000, signal?: AbortSignal): Promise<T> {
     let response: Response;
+    let observedStatus = 0;
     const signals = [AbortSignal.timeout(Math.max(1,Math.ceil(timeout)))];
     if (this.config.signal) signals.push(this.config.signal);
+    if (signal) signals.push(signal);
     try {
-      response = await fetch(this.server+path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(value),redirect:'manual',signal:AbortSignal.any(signals)});
-    } catch {
-      throw new LicenseboxError(this.config.signal?.aborted ? 'cancelled' : 'network_error', 'cannot reach the licensing server');
+      const requestSignal = AbortSignal.any(signals);
+      if (this.config.caBundle && this.server.startsWith('https:')) {
+        const ca = readFileSync(this.config.caBundle);
+        response = await new Promise<Response>((resolve,reject) => {
+          const request = httpsRequest(this.server+path,{method:'POST',headers:{'Content-Type':'application/json'},ca,signal:requestSignal},incoming => {
+            observedStatus = incoming.statusCode ?? 0;
+            const chunks: Buffer[] = []; let length = 0;
+            incoming.on('data',(chunk: Buffer) => {
+              length += chunk.length;
+              if (length > limit) { incoming.destroy(); reject(new LicenseboxError('protocol_error','server response exceeded size limit',incoming.statusCode)); }
+              else chunks.push(chunk);
+            });
+            incoming.on('error',error => reject(new LicenseboxError(requestSignal.aborted && (signal?.aborted || this.config.signal?.aborted) ? 'cancelled' : 'network_error','cannot read server response',incoming.statusCode)));
+            incoming.on('end',() => resolve(new Response([204,205,304].includes(incoming.statusCode ?? 0) ? null : Buffer.concat(chunks),{status:incoming.statusCode ?? 500})));
+          });
+          request.on('error',reject); request.end(JSON.stringify(value));
+        });
+      } else {
+        response = await fetch(this.server+path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(value),redirect:'manual',signal:requestSignal});
+      }
+    } catch (error) {
+      if (error instanceof LicenseboxError) throw error;
+      throw new LicenseboxError(this.config.signal?.aborted || signal?.aborted ? 'cancelled' : 'network_error', 'cannot reach the licensing server',observedStatus);
     }
     const reader = response.body?.getReader();
     const chunks: Uint8Array[] = []; let length = 0;
@@ -204,7 +241,7 @@ export class Client {
         if (length > limit) { await reader.cancel(); throw new LicenseboxError('protocol_error','server response exceeded size limit',response.status); }
         chunks.push(next.value);
       }
-    } catch (error) { if (error instanceof LicenseboxError) throw error; throw new LicenseboxError('network_error','cannot read server response'); }
+    } catch (error) { if (error instanceof LicenseboxError) throw error; throw new LicenseboxError(this.config.signal?.aborted || signal?.aborted ? 'cancelled' : 'network_error','cannot read server response',response.status); }
     let answer: any;
     try { answer = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
     catch { throw new LicenseboxError(response.status === 200 ? 'protocol_error':'http_error',`HTTP ${response.status}`,response.status); }
@@ -217,20 +254,20 @@ export class Client {
     }
     return answer as T;
   }
-  private async save(token: string): Promise<Lease> {
-    const value = verifyLease(token,this.product,this.keys,this.now()); await this.own(value);
+  private async save(token: string, key?: KeyObject): Promise<Lease> {
+    const value = verifyLease(token,this.product,this.keys,this.now()); await this.own(value,key);
     this.write('lease',token); this.remove('policy-denial'); return value;
   }
-  private async call<T = Json>(kind: string, payload: Json, timeout = 20_000): Promise<T> {
+  private async call<T = Json>(kind: string, payload: Json, timeout = 20_000, key?: KeyObject, signal?: AbortSignal): Promise<T> {
     if (!calls.has(kind)) throw new TypeError('unknown signed operation');
-    const token = this.read('lease'); await this.own(parse(token).value);
+    const token = this.read('lease'); await this.own(parse(token).value,key);
     const body = JSON.stringify(payload), at = stamp(this.clock()), binding = this.binding();
     const message = `licensebox ${kind} v2\n${token}\n${binding}\n${at}\n${createHash('sha256').update(body).digest('hex')}`;
-    return this.post<T>(`/v1/${kind}`,{lease:token,binding,time:at,payload:body,version:this.version,signature:encode(sign(null,Buffer.from(message),await this.key()))},timeout);
+    return this.post<T>(`/v1/${kind}`,{lease:token,binding,time:at,payload:body,version:this.version,signature:encode(sign(null,Buffer.from(message),key ?? await this.key()))},timeout,signal);
   }
-  private async renew(timeout = 3000): Promise<Lease> {
-    const sent = this.usage().slice(0,100), response = await this.call('renew',{usage:sent},timeout);
-    const value = await this.save(response.lease); this.usageSent(sent,response.usage === true); return value;
+  private async renew(timeout = 3000, key?: KeyObject, signal?: AbortSignal): Promise<Lease> {
+    const sent = this.usage().slice(0,100), response = await this.call('renew',{usage:sent},timeout,key,signal);
+    const value = await this.save(response.lease,key); this.usageSent(sent,response.usage === true); return value;
   }
   private async getLease(): Promise<Lease> {
     this.binding(); const now = this.now();
@@ -265,6 +302,37 @@ export class Client {
       if (!value.modules.includes(module)) throw new ModuleError(this.product,module,value.email);
       return structuredClone(value);
     });
+  }
+  /** Force a silent contact without activation or installation-key replacement. */
+  heartbeat(module: string, options: {signal?: AbortSignal} = {}): Promise<HeartbeatResult> {
+    return this.locked(async () => {
+      if (typeof module !== 'string' || !module) throw new LicenseboxError('invalid_argument','a nonempty module is required');
+      if (options.signal?.aborted) throw new LicenseboxError('cancelled');
+      const token = this.read('lease');
+      if (!token) throw new LicenseboxError('not_signed_in');
+      const kept = verifyLease(token,this.product,this.keys,this.now(),true), key = this.existingKey();
+      await this.own(kept,key);
+      let value: Lease, online: boolean;
+      try { value = await this.renew(3000,key,options.signal); online = true; }
+      catch (error) {
+        if (!(error instanceof LicenseboxError) || error instanceof PolicyError || ['revoked','invalid_lease','terms_changed'].includes(error.code) || error.status >= 300 && error.status < 500) throw error;
+        if (error.code !== 'network_error' && error.status < 500) throw error;
+        this.denial();
+        if (this.now() >= epoch(kept.expires)) throw new LicenseboxError('offline','the offline lease expired; connect to the internet');
+        value = kept; online = false;
+      }
+      this.checked = value;
+      if (!value.modules.includes(module)) throw new ModuleError(this.product,module,value.email);
+      return {lease:structuredClone(value),online};
+    });
+  }
+  /** Explicit monitoring; construction and require() never start timers. */
+  async watch(module: string, options: WatchOptions = {}): Promise<HeartbeatMonitor> {
+    validateInterval(options.intervalSeconds);
+    options = {...options,signal: this.config.signal && options.signal ? AbortSignal.any([this.config.signal,options.signal]) : options.signal ?? this.config.signal};
+    if (options.signal?.aborted) throw new LicenseboxError('cancelled');
+    const first = await this.heartbeat(module,{signal:options.signal});
+    return new Monitor(this,module,first,this.now(),() => Math.max(this.clock(),this.read('seen') ? epoch(this.read('seen')) : -Infinity),options);
   }
   status(): Promise<Lease> {
     return this.locked(async () => {
@@ -338,5 +406,88 @@ export class Client {
       item[ok?'ok':'failed']++; item.ms += Math.floor(elapsedSeconds*1000);
       this.write('usage.json',JSON.stringify(queued.slice(-1000)));
     });
+  }
+}
+
+
+export interface HeartbeatResult { lease: Lease; online: boolean }
+export interface WatchOptions {
+  /** Seconds; may shorten the server interval (default 300), never lengthen it. */
+  intervalSeconds?: number;
+  signal?: AbortSignal;
+  /** Notification only. Throwing/rejected callbacks are contained. */
+  onStop?: (error?: LicenseboxError) => void | Promise<void>;
+}
+export interface HeartbeatMonitor {
+  /** Pass this signal to protected work and stop at safe cancellation points. */
+  readonly signal: AbortSignal;
+  readonly latest: HeartbeatResult;
+  readonly done: Promise<LicenseboxError | undefined>;
+  stop(): void;
+}
+function validateInterval(interval?: number): void {
+  if (interval !== undefined && (!Number.isFinite(interval) || interval <= 0)) throw new TypeError('intervalSeconds must be positive');
+}
+class Monitor implements HeartbeatMonitor {
+  private readonly controller = new AbortController();
+  private readonly renewal = new AbortController();
+  readonly signal = this.controller.signal;
+  readonly done: Promise<LicenseboxError | undefined>;
+  private resolve!: (error?: LicenseboxError) => void;
+  private result: HeartbeatResult;
+  private deadline: number;
+  private expires: number;
+  private timer?: ReturnType<typeof setTimeout>;
+  private watchdog?: ReturnType<typeof setTimeout>;
+  private readonly cancelled = () => this.finish(new LicenseboxError('cancelled'));
+  constructor(private readonly client: Client, private readonly module: string, first: HeartbeatResult,
+              now: number, private readonly clock: () => number, private readonly options: WatchOptions) {
+    this.result = structuredClone(first);
+    this.expires = epoch(first.lease.expires);
+    this.deadline = performance.now() + Math.max(0,this.expires - now)*1000;
+    this.done = new Promise(resolve => { this.resolve = resolve; });
+    if (options.signal?.aborted) { this.cancelled(); return; }
+    options.signal?.addEventListener('abort',this.cancelled,{once:true});
+    this.armWatchdog();
+    this.schedule();
+  }
+  get latest(): HeartbeatResult { return structuredClone(this.result); }
+  stop(): void { this.finish(); }
+  private expired(): boolean { return performance.now() >= this.deadline; }
+  private finish(error?: LicenseboxError): void {
+    if (this.signal.aborted) return;
+    clearTimeout(this.timer); clearTimeout(this.watchdog);
+    this.options.signal?.removeEventListener('abort',this.cancelled);
+    this.renewal.abort();
+    this.controller.abort(error);
+    this.resolve(error);
+    // Never hold the watchdog or consumer notification hostage to a callback.
+    if (this.options.onStop) Promise.resolve().then(() => this.options.onStop!(error)).catch(() => {});
+  }
+  private armWatchdog(): void {
+    clearTimeout(this.watchdog);
+    if (this.signal.aborted) return;
+    if (this.expired()) { this.finish(new LicenseboxError('expired','the signed heartbeat deadline expired')); return; }
+    this.watchdog = setTimeout(() => this.armWatchdog(),Math.max(1,Math.min(100,this.deadline-performance.now())));
+  }
+  private schedule(): void {
+    if (this.signal.aborted) return;
+    const interval = Math.min(this.options.intervalSeconds ?? Infinity,this.result.lease.heartbeat?.interval_seconds ?? 300);
+    this.timer = setTimeout(() => { void this.check(); },Math.min(2_147_483_647,interval*1000));
+  }
+  private async check(): Promise<void> {
+    try {
+      const result = await this.client.heartbeat(this.module,{signal:this.renewal.signal});
+      if (this.signal.aborted) return;
+      if (this.expired()) { this.finish(new LicenseboxError('expired','the signed heartbeat deadline expired')); return; }
+      this.result = structuredClone(result);
+      if (result.online) {
+        this.expires = epoch(result.lease.expires);
+        this.deadline = performance.now() + Math.max(0,this.expires-this.clock())*1000;
+      }
+      this.armWatchdog(); this.schedule();
+    } catch (error) {
+      this.finish(error instanceof LicenseboxError ? error : new LicenseboxError('monitor_error','heartbeat check failed'));
+    }
   }
 }

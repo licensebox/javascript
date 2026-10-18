@@ -8,11 +8,14 @@ try {
   else if (request.op === 'verify') value = verifyLease(request.token,request.product,request.keys,request.now);
   else if (request.op === 'native') value = nativeBinding(request.product);
   else {
-    const client = new Client({...request,machineBinding:Object.hasOwn(request,'binding')?()=>request.binding:undefined,clock:()=>request.now,onSignIn:()=>{},version:'conformance'});
+    const client = new Client({...request,caBundle:request.ca_bundle,machineBinding:Object.hasOwn(request,'binding')?()=>request.binding:undefined,clock:()=>request.now,onSignIn:()=>{},version:'conformance'});
     switch (request.op) {
       case 'lease': value = await client.lease(); break;
       case 'require': value = await client.require(request.module ?? 'core'); break;
       case 'repeat': value = [await client.require('core'),await client.require('core')]; break;
+      case 'heartbeat': value = await client.heartbeat(request.module ?? 'core'); break;
+      case 'heartbeat-repeat': await client.heartbeat(request.module ?? 'core'); value = await client.heartbeat(request.module ?? 'core'); break;
+      case 'heartbeat-after-require': await client.require(request.module ?? 'core'); value = await client.heartbeat(request.module ?? 'core'); break;
       case 'status': value = await client.status(); break;
       case 'sign_in': value = await client.signIn(3); break;
       case 'logout': await client.logout(); value = null; break;
