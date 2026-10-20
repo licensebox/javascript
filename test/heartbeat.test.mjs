@@ -4,7 +4,7 @@ import {mkdtempSync,rmSync,existsSync,writeFileSync,readFileSync} from 'node:fs'
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {setTimeout as delay} from 'node:timers/promises';
-import {createPrivateKey,createPublicKey,sign} from 'node:crypto';
+import {hybrid,TEST_KEY} from './keys.mjs';
 import {Client,LicenseboxError} from '../dist/index.js';
 
 function result(seconds = 0.2, online = true) {
@@ -13,7 +13,7 @@ function result(seconds = 0.2, online = true) {
 function fixture(t) {
   const directory=mkdtempSync(join(tmpdir(),'licensebox-monitor-'));
   t.after(()=>rmSync(directory,{recursive:true,force:true}));
-  return new Client({product:'demo',keys:{test:'AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE'},directory});
+  return new Client({product:'demo',keys:{test:TEST_KEY},directory});
 }
 async function bounded(promise) {return Promise.race([promise,delay(800).then(()=>{throw new Error('watchdog failed to stop');})]);}
 
@@ -65,14 +65,12 @@ test('explicit stop is idempotent and no slower-than-policy/invalid intervals',a
 });
 
 test('returned heartbeat cannot mutate cached grants or expiry',async t=>{
-  const client=fixture(t), seed=Buffer.from(Array.from({length:32},(_,i)=>i));
-  const signing=createPrivateKey({key:Buffer.concat([Buffer.from('302e020100300506032b657004220420','hex'),seed]),format:'der',type:'pkcs8'});
-  const publicBytes=createPublicKey(signing).export({format:'der',type:'spki'}).subarray(-32).toString('base64url');
+  const client=fixture(t), key=hybrid(Buffer.from(Array.from({length:64},(_,i)=>i)));
   const now=Date.now()/1000,binding='m1:linux-dmi:'+'1'.repeat(64);
-  const lease={v:2,kid:'test',product:'demo',machine:publicBytes,binding,modules:['core'],issued:new Date(now*1000).toISOString(),expires:new Date((now+60)*1000).toISOString()};
-  const payload=Buffer.from(JSON.stringify(lease)),token=payload.toString('base64url')+'.'+sign(null,Buffer.concat([Buffer.from('licensebox lease v2\n'),payload]),signing).toString('base64url');
-  client.keys={test:publicBytes};client.config.machineBinding=()=>binding;
-  writeFileSync(join(client.directory,'install.key'),seed.toString('base64url'));writeFileSync(join(client.directory,'lease'),token);
+  const lease={v:3,kid:'test',product:'demo',machine:key.public,binding,modules:['core'],issued:new Date(now*1000).toISOString(),expires:new Date((now+60)*1000).toISOString()};
+  const payload=Buffer.from(JSON.stringify(lease)),token=payload.toString('base64url')+'.'+key.sign(Buffer.concat([Buffer.from('licensebox lease v3\ned25519-mldsa65\n'),payload])).toString('base64url');
+  client.keys={test:key.public};client.config.machineBinding=()=>binding;
+  writeFileSync(join(client.directory,'install.key'),key.installKey);writeFileSync(join(client.directory,'lease'),token);
   client.post=async()=>({lease:token});
   const response=await client.heartbeat('core');response.lease.modules.push('export');response.lease.expires='2099-01-01T00:00:00Z';
   await assert.rejects(client.require('export'),error=>error.code==='module_denied');

@@ -42,8 +42,15 @@ const sources = new Set(['linux-dmi', 'linux-device-tree', 'linux-machine-id', '
 const policies = new Set(['seat_transferred', 'location_denied', 'location_unknown', 'machine_changed']);
 const calls = new Set(['renew', 'modules', 'request', 'requests', 'access-link']);
 const limit = 1 << 20;
-const privatePrefix = Buffer.from('302e020100300506032b657004220420', 'hex');
-const publicPrefix = Buffer.from('302a300506032b6570032100', 'hex');
+// Protocol v3 signs everything with Ed25519 and ML-DSA-65 (FIPS 204) together;
+// both must verify. Keys are written "<alg>:<base64url>", Ed25519 part first.
+export const ALGORITHM = 'ed25519-mldsa65';
+const edPrivate = Buffer.from('302e020100300506032b657004220420', 'hex');
+const edPublic = Buffer.from('302a300506032b6570032100', 'hex');
+// PKCS#8 holding only the ML-DSA-65 seed, and SPKI of its public key.
+const mlPrivate = Buffer.from('3034020100300b060960864801650304031204228020', 'hex');
+const mlPublic = Buffer.from('308207b2300b0609608648016503040312038207a100', 'hex');
+const publicSize = 32 + 1952, signatureSize = 64 + 3309, seedSize = 32 + 32;
 const encode = (value: Uint8Array): string => Buffer.from(value).toString('base64url');
 function decode(value: string, size?: number): Buffer {
   if (typeof value !== 'string' || !/^[A-Za-z0-9_-]+$/.test(value)) throw new LicenseboxError('malformed', 'invalid base64url value');
@@ -87,10 +94,56 @@ function epoch(value: unknown): number {
   if (!Number.isFinite(result)) throw new LicenseboxError('malformed', 'invalid timestamp');
   return result;
 }
+/** A hybrid installation key, kept as its 64-byte seed. */
+interface InstallKey { seed: Buffer; ed: KeyObject; ml: KeyObject }
+function installKey(seed: Buffer): InstallKey {
+  return {seed,
+    ed: createPrivateKey({key: Buffer.concat([edPrivate, seed.subarray(0, 32)]), format: 'der', type: 'pkcs8'}),
+    ml: createPrivateKey({key: Buffer.concat([mlPrivate, seed.subarray(32)]), format: 'der', type: 'pkcs8'})};
+}
+function algorithmOf(text: unknown): string {
+  const at = typeof text === 'string' ? text.indexOf(':') : -1;
+  if (at < 0 || (text as string).slice(0, at) !== ALGORITHM) throw new LicenseboxError('malformed', 'unknown key algorithm');
+  return (text as string).slice(at + 1);
+}
+function readInstallKey(text: string): InstallKey { return installKey(decode(algorithmOf(text.trim()), seedSize)); }
+function writeInstallKey(key: InstallKey): string { return `${ALGORITHM}:${encode(key.seed)}`; }
+function publicOf(key: InstallKey): string {
+  const ed = createPublicKey(key.ed).export({format: 'der', type: 'spki'}) as Buffer;
+  const ml = createPublicKey(key.ml).export({format: 'der', type: 'spki'}) as Buffer;
+  return `${ALGORITHM}:${encode(Buffer.concat([ed.subarray(-32), ml.subarray(-1952)]))}`;
+}
+/** Pure Ed25519, and hedged ML-DSA-65 with an empty context. */
+function signWith(key: InstallKey, message: string): string {
+  const data = Buffer.from(message);
+  return encode(Buffer.concat([sign(null, data, key.ed), sign(null, data, key.ml)]));
+}
+let mldsa: boolean | undefined;
+/** ML-DSA arrived in Node.js 24.6; without it no key would read, so say why. */
+function requireMLDSA(): void {
+  if (mldsa === undefined) {
+    try { mldsa = createPrivateKey({key: Buffer.concat([mlPrivate, Buffer.alloc(32)]), format: 'der', type: 'pkcs8'}).asymmetricKeyType === 'ml-dsa-65'; } catch { mldsa = false; }
+  }
+  if (!mldsa) throw new LicenseboxError('unsupported_runtime', `Node.js ${process.versions.node} lacks ML-DSA; Licensebox needs Node.js 24.6 or later`);
+}
+/** Reads a trusted or installation public key; anything but a whole hybrid key is malformed. */
+function publicKey(text: unknown): { ed: KeyObject; ml: KeyObject } {
+  requireMLDSA();
+  const raw = decode(algorithmOf(text), publicSize);
+  try {
+    return {ed: createPublicKey({key: Buffer.concat([edPublic, raw.subarray(0, 32)]), format: 'der', type: 'spki'}),
+      ml: createPublicKey({key: Buffer.concat([mlPublic, raw.subarray(32)]), format: 'der', type: 'spki'})};
+  } catch { throw new LicenseboxError('malformed', 'invalid public key'); }
+}
+/** Both halves must verify. The algorithm is the trusted key's. */
+function verifyWith(text: string, message: Buffer, signature: Buffer): boolean {
+  const key = publicKey(text);
+  return signature.length === signatureSize && verify(null, message, key.ed, signature.subarray(0, 64)) && verify(null, message, key.ml, signature.subarray(64));
+}
 function parse(token: string): { value: Lease; payload: Buffer; signature: Buffer } {
   const parts = token.trim().split('.');
   if (parts.length !== 2) throw new LicenseboxError('malformed', 'invalid lease token');
-  const payload = decode(parts[0]), signature = decode(parts[1], 64);
+  const payload = decode(parts[0]), signature = decode(parts[1]);
   let value: unknown;
   try { value = JSON.parse(payload.toString('utf8')); } catch { throw new LicenseboxError('malformed', 'invalid lease JSON'); }
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new LicenseboxError('malformed');
@@ -98,12 +151,11 @@ function parse(token: string): { value: Lease; payload: Buffer; signature: Buffe
 }
 export function verifyLease(token: string, product: string, keys: Record<string, string>, now: number, allowExpired = false): Lease {
   const {value, payload, signature} = parse(token);
-  if (value.v !== 2) throw new LicenseboxError('version', 'unsupported lease version; update the application');
+  if (value.v !== 3) throw new LicenseboxError('version', 'unsupported lease version; update the application');
   if (!Object.hasOwn(keys, value.kid)) throw new LicenseboxError('unknown_key');
-  const key = createPublicKey({key: Buffer.concat([publicPrefix, decode(keys[value.kid], 32)]), format: 'der', type: 'spki'});
-  if (!verify(null, Buffer.concat([Buffer.from('licensebox lease v2\n'), payload]), key, signature)) throw new LicenseboxError('bad_signature');
+  if (!verifyWith(keys[value.kid], Buffer.concat([Buffer.from(`licensebox lease v3\n${ALGORITHM}\n`), payload]), signature)) throw new LicenseboxError('bad_signature');
   if (value.product !== product || !validBinding(value.binding)) throw new LicenseboxError('malformed', 'lease product or native binding does not match');
-  decode(value.machine, 32);
+  publicKey(value.machine);
   if (!Array.isArray(value.modules) || value.modules.some(x => typeof x !== 'string')) throw new LicenseboxError('malformed', 'invalid module list');
   const heartbeat = value.heartbeat;
   if (heartbeat != null) {
@@ -127,7 +179,7 @@ export class Client {
   private queue: Promise<void> = Promise.resolve();
   constructor(private readonly config: Config) {
     if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$/.test(config.product) || !Object.keys(config.keys).length) throw new TypeError('a product ID and trusted public keys are required');
-    for (const key of Object.values(config.keys)) decode(key, 32);
+    for (const key of Object.values(config.keys)) publicKey(key);
     const server = new URL(config.server ?? 'https://licensebox.dev');
     if (server.username || server.password || server.search || server.hash || server.protocol !== 'https:' && !(server.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(server.hostname))) throw new TypeError('server must use HTTPS (HTTP is allowed only on loopback)');
     this.product = config.product; this.keys = {...config.keys}; this.version = config.version ?? ''; this.server = server.href.replace(/\/$/, '');
@@ -168,31 +220,30 @@ export class Client {
     this.write('seen', new Date(value*1000).toISOString());
     return value;
   }
-  private async key(): Promise<KeyObject> {
+  private async key(): Promise<InstallKey> {
     mkdirSync(this.directory, {recursive:true, mode:0o700});
     for (let attempt=0; attempt<40; attempt++) {
       const seed = this.read('install.key');
       if (seed) {
-        try { return createPrivateKey({key:Buffer.concat([privatePrefix, decode(seed,32)]), format:'der', type:'pkcs8'}); } catch { /* another process may be writing */ }
+        try { return readInstallKey(seed); } catch { /* another process may be writing */ }
       }
       let descriptor: number;
       try { descriptor = openSync(join(this.directory,'install.key'),'wx',0o600); }
       catch (error) { if ((error as NodeJS.ErrnoException).code === 'EEXIST') { await delay(25); continue; } throw error; }
-      const raw = randomBytes(32);
-      try { writeFileSync(descriptor, `${encode(raw)}\n`); } finally { closeSync(descriptor); }
-      return createPrivateKey({key:Buffer.concat([privatePrefix,raw]), format:'der', type:'pkcs8'});
+      const key = installKey(randomBytes(seedSize));
+      try { writeFileSync(descriptor, `${writeInstallKey(key)}\n`); } finally { closeSync(descriptor); }
+      return key;
     }
     throw new LicenseboxError('io_error','installation key is damaged or being written by another process');
   }
-  private publicKey(key: KeyObject): string { return encode((createPublicKey(key).export({format:'der',type:'spki'}) as Buffer).subarray(-32)); }
-  private existingKey(): KeyObject {
+  private existingKey(): InstallKey {
     const seed = this.read('install.key');
     if (!seed) throw new LicenseboxError('not_signed_in','the installation key is unavailable; explicitly sign in');
-    try { return createPrivateKey({key:Buffer.concat([privatePrefix,decode(seed,32)]),format:'der',type:'pkcs8'}); }
+    try { return readInstallKey(seed); }
     catch { throw new LicenseboxError('io_error','the installation key is damaged; explicitly sign in'); }
   }
-  private async own(value: Lease, key?: KeyObject): Promise<void> {
-    if (value.binding !== this.binding() || value.machine !== this.publicKey(key ?? await this.key())) throw new PolicyError('machine_changed','these credentials belong to another machine; explicitly sign in to activate here');
+  private async own(value: Lease, key?: InstallKey): Promise<void> {
+    if (value.binding !== this.binding() || value.machine !== publicOf(key ?? await this.key())) throw new PolicyError('machine_changed','these credentials belong to another machine; explicitly sign in to activate here');
   }
   private denial(): void {
     const saved = this.read('policy-denial');
@@ -262,18 +313,18 @@ export class Client {
     }
     return answer as T;
   }
-  private async save(token: string, key?: KeyObject): Promise<Lease> {
+  private async save(token: string, key?: InstallKey): Promise<Lease> {
     const value = verifyLease(token,this.product,this.keys,this.now()); await this.own(value,key);
     this.write('lease',token); this.remove('policy-denial'); return value;
   }
-  private async call<T = Json>(kind: string, payload: Json, timeout = 20_000, key?: KeyObject, signal?: AbortSignal): Promise<T> {
+  private async call<T = Json>(kind: string, payload: Json, timeout = 20_000, key?: InstallKey, signal?: AbortSignal): Promise<T> {
     if (!calls.has(kind)) throw new TypeError('unknown signed operation');
     const token = this.read('lease'); await this.own(parse(token).value,key);
     const body = JSON.stringify(payload), at = stamp(this.clock()), binding = this.binding();
-    const message = `licensebox ${kind} v2\n${token}\n${binding}\n${at}\n${createHash('sha256').update(body).digest('hex')}`;
-    return this.post<T>(`/v1/${kind}`,{lease:token,binding,time:at,payload:body,version:this.version,signature:encode(sign(null,Buffer.from(message),key ?? await this.key()))},timeout,signal);
+    const message = `licensebox ${kind} v3\n${ALGORITHM}\n${token}\n${binding}\n${at}\n${createHash('sha256').update(body).digest('hex')}`;
+    return this.post<T>(`/v1/${kind}`,{lease:token,binding,time:at,payload:body,version:this.version,signature:signWith(key ?? await this.key(),message)},timeout,signal);
   }
-  private async renew(timeout = 3000, key?: KeyObject, signal?: AbortSignal): Promise<Lease> {
+  private async renew(timeout = 3000, key?: InstallKey, signal?: AbortSignal): Promise<Lease> {
     const sent = this.usage().slice(0,100), response = await this.call('renew',{usage:sent},timeout,key,signal);
     const value = await this.save(response.lease,key); this.usageSent(sent,response.usage === true); return value;
   }
@@ -350,7 +401,7 @@ export class Client {
     });
   }
   signIn(timeoutSeconds?: number): Promise<Lease> { return this.locked(() => this.activate(true,timeoutSeconds)); }
-  private async rotate(): Promise<void> { this.write('install.key',encode(randomBytes(32))); this.forget(); }
+  private async rotate(): Promise<void> { this.write('install.key',writeInstallKey(installKey(randomBytes(seedSize)))); this.forget(); }
   private async activate(explicit: boolean, timeoutSeconds?: number, rotated = false): Promise<Lease> {
     const binding = this.binding(); let old: Lease | undefined;
     try { old = parse(this.read('lease')).value; } catch { /* no readable old lease */ }
@@ -360,7 +411,7 @@ export class Client {
     }
     const key = await this.key(), at = stamp(this.clock());
     let device: Json;
-    try { device = await this.post('/v1/device',{product:this.product,machine:this.publicKey(key),binding,os:platform() === 'win32'?'windows':platform(),arch:arch()==='x64'?'amd64':arch(),version:this.version,time:at,signature:encode(sign(null,Buffer.from(`licensebox device v2\n${this.product}\n${binding}\n${at}`),key))}); }
+    try { device = await this.post('/v1/device',{product:this.product,machine:publicOf(key),binding,os:platform() === 'win32'?'windows':platform(),arch:arch()==='x64'?'amd64':arch(),version:this.version,time:at,signature:signWith(key,`licensebox device v3\n${ALGORITHM}\n${this.product}\n${binding}\n${at}`)}); }
     catch (error) {
       if (explicit && !rotated && error instanceof PolicyError && error.code === 'machine_changed') { await this.rotate(); return this.activate(false,timeoutSeconds,true); }
       throw error;
@@ -376,7 +427,7 @@ export class Client {
       if (Date.now() >= deadline) break;
       const at = stamp(this.clock());
       try {
-        const response = await this.post('/v1/token',{device_code:device.device_code,binding,time:at,signature:encode(sign(null,Buffer.from(`licensebox token v2\n${device.device_code}\n${binding}\n${at}`),key))},Math.min(20_000,deadline-Date.now()));
+        const response = await this.post('/v1/token',{device_code:device.device_code,binding,time:at,signature:signWith(key,`licensebox token v3\n${ALGORITHM}\n${device.device_code}\n${binding}\n${at}`)},Math.min(20_000,deadline-Date.now()));
         const value = await this.save(response.lease);
         if (old && old.user !== value.user) this.remove('usage.json');
         this.usageSent([],response.usage === true); this.checked = value; return structuredClone(value);

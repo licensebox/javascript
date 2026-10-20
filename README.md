@@ -3,7 +3,8 @@
 One Node.js SDK, written in TypeScript and shipped as JavaScript with type
 declarations. Email sign-in, native machine-bound licences, silent renewal and
 signed offline access for desktop and command-line applications. No runtime npm
-dependencies; cryptography uses Node's built-in Ed25519 implementation.
+dependencies; cryptography uses Node's built-in Ed25519 and ML-DSA-65. Protocol v3
+signs every licence and request with both, and both must verify.
 
 ```sh
 git clone https://github.com/licensebox/javascript.git
@@ -48,7 +49,8 @@ and persist across restarts/offline use. Explicit sign-in can transfer a seat.
 
 ## Runtime support
 
-Node.js 22+ on Linux is runtime-validated. macOS native identity is implemented
+Node.js 24.6+ (the first with ML-DSA) on Linux is runtime-validated; older Node
+throws `unsupported_runtime`. macOS native identity is implemented
 but unvalidated. Windows currently requires a native SMBIOS `machineBinding`
 adapter; absence fails closed. This provider seam is for trusted platform
 integrations/testing, never an end-user-supplied identifier. Browser JavaScript,
@@ -60,7 +62,7 @@ Default offline access is 24 hours, refreshed silently per process. There is no
 implicit background heartbeat. Payments and billing remain outside Licensebox.
 
 See [protocol/conformance](https://github.com/licensebox/protocol),
-[Node crypto documentation](https://nodejs.org/download/release/v22.18.0/docs/api/crypto.html)
+[Node crypto documentation](https://nodejs.org/api/crypto.html)
 and [Licensebox docs](https://licensebox.dev/docs). Administration stays in the
 [Go CLI](https://github.com/licensebox/go).
 
