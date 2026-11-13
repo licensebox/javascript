@@ -38,13 +38,15 @@ cancellation. `caBundle` can supply trusted TLS roots while retaining hostname v
 All operations are asynchronous: `require(module)`, `lease()`, `status()` (local
 only), `signIn(timeoutSeconds)`, `logout()`, `modules()`,
 `requestAccess(['export'], 'why')`, `requests()`, `accessLink()`, and
-`record('export', success, elapsedSeconds)`. Access links are private credentials.
+`record('export', success, elapsedSeconds)`, `checkout(module)`,
+`checkin(...modules)` and `enrol(token)`. Access links are private credentials.
 Record only fixed command names, never filenames, arguments or user data.
 
 `PolicyError.code` is `machine_changed`, `seat_transferred`, `location_denied` or
 `location_unknown`; `ModuleError` means the module is missing. Other
 `LicenseboxError.code` values include `offline`, `revoked`, `denied`,
-`sign_in_expired`, `expired`, `identity_unavailable`. Refusals stop protected work
+`sign_in_expired`, `expired`, `identity_unavailable`, `no_free_copy` and
+`invalid_token`. Refusals stop protected work
 and persist across restarts/offline use. Explicit sign-in can transfer a seat.
 
 ## Runtime support
@@ -100,3 +102,23 @@ signal, and CPU-bound work must yield to the event loop or run in a worker.
 (or `undefined` for explicit stop). Optional `onStop(error)` notifications contain
 thrown errors and rejected promises. Client construction and `require()` do not
 schedule background checks.
+
+## Seats per module, floating copies and service accounts
+
+A module can have seats of its own. It is in a machine's lease only while that
+machine holds one of its seats; elsewhere the lease names it in `elsewhere`,
+and `ModuleError.elsewhere` is set: an explicit `signIn()` moves the seat here.
+
+A customer can hold a pool of floating copies of a module; the lease names
+such modules in `floating`. `require(module)` checks a copy out when the module
+is not held outright, and throws `LicenseboxError` with code `no_free_copy`
+when every copy is in use. Keep the copy with `heartbeat` or `watch` while the
+work runs, and return it with `checkin(module)`. A copy lives only as long as
+the lease, so a crashed application frees its copy when the heartbeat grace
+passes; a heartbeat takes a lapsed copy again if one is free.
+
+A server or build runner can be licensed as a service account. Set the
+one-time token an admin issued as `LICENSEBOX_ENROL_TOKEN`, or pass
+`enrolToken` in the config: the first `require`, `lease` or `signIn` enrols the
+machine without a browser. A used or expired token throws code
+`invalid_token`.

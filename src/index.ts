@@ -11,6 +11,12 @@ export interface Lease {
   v: number; kid: string; product: string; user: string; email: string; machine: string; binding: string;
   modules: string[]; issued: string; expires: string; terms: number;
   heartbeat?: {interval_seconds: number; grace_seconds: number} | null;
+  /** Modules the user holds whose seats, counted apart, are on other machines. */
+  elsewhere?: string[];
+  /** Modules the user may check out from their customer's pool of floating copies. */
+  floating?: string[];
+  /** Floating copies this machine has checked out; they last until expires unless renewed. */
+  checkouts?: string[];
 }
 export interface Module { name: string; description?: string; free: boolean; have: boolean; requested?: boolean }
 export interface AccessRequest { id: string; modules: string[]; note?: string; status: string; granted?: string[]; until?: string; answer?: string }
@@ -24,7 +30,11 @@ export interface Config {
   signal?: AbortSignal;
   /** Optional trusted TLS root bundle; hostname verification stays enabled. */
   caBundle?: string;
+  /** A service account's one-time enrolment token; unset means LICENSEBOX_ENROL_TOKEN. */
+  enrolToken?: string;
 }
+/** The environment variable a service account's enrolment token is read from. */
+export const TOKEN_ENV = 'LICENSEBOX_ENROL_TOKEN';
 
 export class LicenseboxError extends Error {
   constructor(public readonly code: string, detail = code.replaceAll('_', ' '), public readonly status = 0) {
@@ -32,15 +42,21 @@ export class LicenseboxError extends Error {
   }
 }
 export class PolicyError extends LicenseboxError { override name = 'PolicyError'; }
+/** A module the lease leaves out. `elsewhere` is set when the user holds it but
+ * its seat, counted apart from the product's, is on another machine: an explicit
+ * sign-in here moves it. */
 export class ModuleError extends LicenseboxError {
-  constructor(public readonly product: string, public readonly module: string, public readonly email: string) {
-    super('module_denied', `${product}: ${module} is not licensed to ${email}`); this.name = 'ModuleError';
+  constructor(public readonly product: string, public readonly module: string, public readonly email: string, public readonly elsewhere = false) {
+    super('module_denied', elsewhere ? `${product}: the seat of ${module} is on another machine; explicitly sign in to move it here` : `${product}: ${module} is not licensed to ${email || 'this account'}`); this.name = 'ModuleError';
   }
 }
+/** The lease lets its holder run the module: one of its modules, or a floating copy checked out here. */
+export function has(lease: Lease, module: string): boolean { return lease.modules.includes(module) || (lease.checkouts ?? []).includes(module); }
+const moduleError = (product: string, module: string, lease: Lease): ModuleError => new ModuleError(product, module, lease.email, (lease.elsewhere ?? []).includes(module));
 
 const sources = new Set(['linux-dmi', 'linux-device-tree', 'linux-machine-id', 'windows-smbios', 'macos-platform']);
 const policies = new Set(['seat_transferred', 'location_denied', 'location_unknown', 'machine_changed']);
-const calls = new Set(['renew', 'modules', 'request', 'requests', 'access-link']);
+const calls = new Set(['renew', 'modules', 'request', 'requests', 'access-link', 'checkout', 'checkin']);
 const limit = 1 << 20;
 // Protocol v3 signs everything with Ed25519 and ML-DSA-65 (FIPS 204) together;
 // both must verify. Keys are written "<alg>:<base64url>", Ed25519 part first.
@@ -157,6 +173,10 @@ export function verifyLease(token: string, product: string, keys: Record<string,
   if (value.product !== product || !validBinding(value.binding)) throw new LicenseboxError('malformed', 'lease product or native binding does not match');
   publicKey(value.machine);
   if (!Array.isArray(value.modules) || value.modules.some(x => typeof x !== 'string')) throw new LicenseboxError('malformed', 'invalid module list');
+  for (const field of ['elsewhere', 'floating', 'checkouts'] as const) {
+    const listed: unknown = value[field];
+    if (listed !== undefined && (!Array.isArray(listed) || listed.some(x => typeof x !== 'string'))) throw new LicenseboxError('malformed', `invalid ${field} list`);
+  }
   const heartbeat = value.heartbeat;
   if (heartbeat != null) {
     if (typeof heartbeat !== 'object' || Array.isArray(heartbeat)) throw new LicenseboxError('malformed','invalid heartbeat policy');
@@ -354,11 +374,12 @@ export class Client {
   require(module: string): Promise<Lease> {
     return this.locked(async () => {
       let value = await this.getLease();
-      if (!value.modules.includes(module) && !this.checked) {
+      if (!has(value,module) && !this.checked) {
         try { value = this.checked = await this.renew(); }
         catch (error) { if (!(error instanceof LicenseboxError) || error instanceof PolicyError || error.code !== 'network_error' && error.status < 500) throw error; }
       }
-      if (!value.modules.includes(module)) throw new ModuleError(this.product,module,value.email);
+      if (!has(value,module) && (value.floating ?? []).includes(module)) return structuredClone(await this.takeCopy(module));
+      if (!has(value,module)) throw moduleError(this.product,module,value);
       return structuredClone(value);
     });
   }
@@ -381,7 +402,9 @@ export class Client {
         value = kept; online = false;
       }
       this.checked = value;
-      if (!value.modules.includes(module)) throw new ModuleError(this.product,module,value.email);
+      // A lapsed copy, as after a gap longer than the grace or freed by an admin, is taken again if one is free.
+      if (online && !has(value,module) && (value.floating ?? []).includes(module) && (kept.checkouts ?? []).includes(module)) value = await this.takeCopy(module,key);
+      if (!has(value,module)) throw moduleError(this.product,module,value);
       return {lease:structuredClone(value),online};
     });
   }
@@ -402,7 +425,41 @@ export class Client {
   }
   signIn(timeoutSeconds?: number): Promise<Lease> { return this.locked(() => this.activate(true,timeoutSeconds)); }
   private async rotate(): Promise<void> { this.write('install.key',writeInstallKey(installKey(randomBytes(seedSize)))); this.forget(); }
+  private enrolToken(): string { return (this.config.enrolToken ?? process.env[TOKEN_ENV] ?? '').trim(); }
+  /** Sign this machine in as a service account with a one-time token an admin issued, without a browser. */
+  enrol(token: string): Promise<Lease> { return this.locked(() => this.enrolWith(token)); }
+  private async enrolWith(token: string): Promise<Lease> {
+    token = typeof token === 'string' ? token.trim() : '';
+    if (!token) throw new LicenseboxError('invalid_token','an enrolment token is required');
+    const binding = this.binding();
+    try { const old = parse(this.read('lease')).value; if (validBinding(old.binding) && old.binding !== binding) await this.rotate(); } catch { /* no readable old lease */ }
+    const key = await this.key(), at = stamp(this.clock()), secret = createHash('sha256').update(token).digest('hex');
+    let response: Json;
+    try { response = await this.post('/v1/enrol',{product:this.product,token,machine:publicOf(key),binding,os:platform() === 'win32'?'windows':platform(),arch:arch()==='x64'?'amd64':arch(),version:this.version,time:at,signature:signWith(key,`licensebox enrol v3\n${ALGORITHM}\n${this.product}\n${secret}\n${binding}\n${at}`)}); }
+    catch (error) { if (error instanceof LicenseboxError && error.code === 'access_denied') throw new LicenseboxError('denied'); throw error; }
+    const value = await this.save(response.lease,key);
+    this.usageSent([],response.usage === true); this.checked = value; return structuredClone(value);
+  }
+  /** Check a floating copy of the module out for this machine: `no_free_copy` when every
+   * copy is in use. Keep it with heartbeats while working, and check it in after. */
+  checkout(module: string): Promise<Lease> { return this.locked(async () => { await this.getLease(); return structuredClone(await this.takeCopy(module)); }); }
+  private async takeCopy(module: string, key?: InstallKey): Promise<Lease> {
+    let value: Lease;
+    try { value = await this.leaseCall('checkout',{module},key); }
+    catch (error) { if (error instanceof LicenseboxError && error.code === 'not_floating') throw new ModuleError(this.product,module,parse(this.read('lease')).value.email); throw error; }
+    if (!has(value,module)) throw moduleError(this.product,module,value);
+    return value;
+  }
+  /** Return this machine's floating copies of the modules, or all of them with none named, to the pool. */
+  checkin(...modules: string[]): Promise<void> { return this.locked(async () => { await this.leaseCall('checkin',{modules}); }); }
+  private async leaseCall(kind: string, payload: Json, key?: InstallKey): Promise<Lease> {
+    if (!this.read('lease')) throw new LicenseboxError('not_signed_in');
+    const response = await this.call(kind,payload,20_000,key);
+    return this.checked = await this.save(response.lease,key);
+  }
   private async activate(explicit: boolean, timeoutSeconds?: number, rotated = false): Promise<Lease> {
+    const enrolment = this.enrolToken();
+    if (enrolment) return this.enrolWith(enrolment);
     const binding = this.binding(); let old: Lease | undefined;
     try { old = parse(this.read('lease')).value; } catch { /* no readable old lease */ }
     if (old && validBinding(old.binding) && old.binding !== binding) {
